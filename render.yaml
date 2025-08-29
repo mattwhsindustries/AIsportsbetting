@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ai-sports-gambling-platform
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    autoDeploy: true
+    envVars:
+      - key: ODDS_API_KEY
+        sync: false
+      - key: ODDS_API_BASE_URL
+        value: https://api.the-odds-api.com/v4
+      - key: CACHE_TTL_SECONDS
+        value: "60"
+      - key: HIDE_STARTED_BUFFER_MINUTES
+        value: "0"
+      - key: CORS_ORIGINS
+        value: ""
