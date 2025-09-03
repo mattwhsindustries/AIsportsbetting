@@ -29,12 +29,13 @@ const getEdgeColor = (edge) => {
 export function NFLPlayerProps({ sortBy, filterGrade, onSelectBet }) {
   const [bets, setBets] = useState(null as any);
   const [error, setError] = useState(null as any);
+  const [warning, setWarning] = useState(null as any);
 
   useEffect(() => {
     const ctrl = new AbortController();
     fetch(`${API_BASE}/api/nfl/props`, { signal: ctrl.signal })
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-      .then(json => setBets(json.bets ?? []))
+      .then(json => { setBets(json.bets ?? []); setWarning(json.warning ?? null); })
       .catch(e => setError(e.message || 'Failed to load NFL props'));
     return () => ctrl.abort();
   }, []);
@@ -77,10 +78,13 @@ export function NFLPlayerProps({ sortBy, filterGrade, onSelectBet }) {
             const ctrl = new AbortController();
             fetch(`${API_BASE}/api/nfl/props`, { signal: ctrl.signal })
               .then(r => r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`)))
-              .then(json => setBets(json.bets ?? []))
+              .then(json => { setBets(json.bets ?? []); setWarning(json.warning ?? null); })
               .catch(e => setError(e.message || 'Failed to load NFL props'));
           }}>Retry</Button>
         </div>
+      )}
+      {!error && warning && (
+        <div className="text-sm text-yellow-400">{warning}</div>
       )}
       {!error && (Array.isArray(bets) && bets.length === 0) && (
         <div className="text-sm text-gray-400">No live NFL props qualify (C+ or better) right now. Check back later.</div>

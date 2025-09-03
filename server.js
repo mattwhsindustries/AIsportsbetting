@@ -368,8 +368,8 @@ app.get('/api/cfb/bets', async (req, res) => {
 				const away = game.away_team;
 						if (!isFutureCommence(gameTime)) return; // skip started games
 				const opponentBy = (team) => (team === home ? away : home);
-				const bm = (game.bookmakers || [])[0];
-				const markets = bm?.markets || [];
+				// Aggregate across all available bookmakers for broader coverage
+				const markets = (game.bookmakers || []).flatMap(b => b.markets || []);
 
 				  markets.forEach(mkt => {
 					const key = mkt.key || '';
@@ -381,7 +381,7 @@ app.get('/api/cfb/bets', async (req, res) => {
 
 					  // Derive team guess (best-effort)
 					  const derivedTeam = parseTeamFromText(out.description || out.participant || player, home, away);
-					  const team = derivedTeam || home;
+						const team = derivedTeam || home;
 						const propMap = {
 							player_pass_yds: 'Passing Yards',
 							player_rec_yds: 'Receiving Yards',
@@ -406,7 +406,7 @@ app.get('/api/cfb/bets', async (req, res) => {
 							id: `${game.id}-${key}-${player}-${type}`,
 							player,
 							team,
-										opponent: `${team === home ? 'vs ' + away : team === away ? '@ ' + home : 'vs ' + away}`,
+										opponent: `${team === home ? 'vs ' + away : team === away ? '@ ' + home : 'vs ' + opponentBy(team)}`,
 							prop,
 							line,
 							type,
