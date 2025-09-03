@@ -328,7 +328,7 @@ app.get('/api/cfb/bets', async (req, res) => {
 	}
 });
 
-		// Live NFL player props (basic market mapping)
+		// Live NFL player props via per-event odds endpoint
 	app.get('/api/nfl/props', async (req, res) => {
 		try {
 				if (cache.nflProps.data && Date.now() - cache.nflProps.at < TTL_MS) {
@@ -338,102 +338,139 @@ app.get('/api/cfb/bets', async (req, res) => {
 					};
 					filtered.count = filtered.bets.length;
 					return res.json(filtered);
-			}
-			const markets = [
-				'player_pass_yds',
-				'player_rec_yds',
-				'player_rush_yds',
-				'player_receptions',
-				'player_rush_att',
-				'player_pass_tds',
-				'player_anytime_td'
-			].join(',');
-
-			const url = `${ODDS_API_BASE_URL}/sports/americanfootball_nfl/odds`;
-			const resp = await axios.get(url, {
-				params: {
-					apiKey: ODDS_API_KEY,
-					regions: 'us',
-					markets,
-					oddsFormat: 'american'
 				}
-			});
-			logOddsHeaders(resp.headers);
-			const data = resp.data;
 
-			const bets = [];
-					(data || []).forEach(game => {
-				const gameTime = game.commence_time;
-				const home = game.home_team;
-				const away = game.away_team;
-						if (!isFutureCommence(gameTime)) return; // skip started games
-				const opponentBy = (team) => (team === home ? away : home);
-				// Aggregate across all available bookmakers for broader coverage
-				const markets = (game.bookmakers || []).flatMap(b => b.markets || []);
+				const marketList = [
+					'player_pass_yds',
+					'player_rec_yds',
+					'player_rush_yds',
+					'player_receptions',
+					'player_rush_att',
+					'player_pass_tds',
+					'player_anytime_td'
+				];
+				const markets = marketList.join(',');
 
-				  markets.forEach(mkt => {
-					const key = mkt.key || '';
-					(mkt.outcomes || []).forEach(out => {
-						// The Odds API player prop outcome often includes description or participant
-					  const player = out.description || out.participant || out.name || null;
-						const overUnder = (out.name || '').toLowerCase();
-						if (!player) return;
+				// 1) Get upcoming events (games)
+				const evUrl = `${ODDS_API_BASE_URL}/sports/americanfootball_nfl/events`;
+				const evResp = await axios.get(evUrl, { params: { apiKey: ODDS_API_KEY } });
+				logOddsHeaders(evResp.headers);
+				const allEvents = (evResp.data || []).filter(e => isFutureCommence(e.commence_time));
+				// safety cap to reduce API calls and stay within rate limits
+				const maxEvents = Number(process.env.MAX_NFL_EVENTS || 12);
+				const events = allEvents.slice(0, Math.max(1, maxEvents));
 
-					  // Derive team guess (best-effort)
-					  const derivedTeam = parseTeamFromText(out.description || out.participant || player, home, away);
-						const team = derivedTeam || home;
-						const propMap = {
-							player_pass_yds: 'Passing Yards',
-							player_rec_yds: 'Receiving Yards',
-							player_rush_yds: 'Rushing Yards',
-							player_receptions: 'Receptions',
-							player_rush_att: 'Rushing Attempts',
-							player_pass_tds: 'Passing TDs',
-							player_anytime_td: 'Anytime TD'
-						};
-						const prop = propMap[key] || key;
-						const type = overUnder.includes('over') ? 'Over' : overUnder.includes('under') ? 'Under' : 'Over';
-						const line = out.point ?? null;
-						const odds = out.price ?? null;
+				// Small concurrency limiter
+				async function mapWithConcurrency(items, limit, mapper) {
+					const results = []; const executing = [];
+					for (const item of items) {
+						const p = Promise.resolve().then(() => mapper(item));
+						results.push(p);
+						if (limit <= 1) continue;
+						executing.push(p);
+						if (executing.length >= limit) {
+							await Promise.race(executing);
+							executing.splice(0, executing.length - (limit - 1));
+						}
+					}
+					return Promise.all(results);
+				}
 
-						if (odds == null || line == null) return;
-						const prob = impliedProbability(odds) ?? 0.5;
-						const hitProbability = Math.round(prob * 100);
-						const grade = gradeFromProbability(prob);
-						if (!['A+','A','B+','B','C+'].includes(grade)) return;
+				// 2) For each event, fetch per-event odds for player markets
+				const conc = Number(process.env.NFL_PROPS_CONCURRENCY || 4);
+				const perEvent = await mapWithConcurrency(events, conc, async (ev) => {
+					const url = `${ODDS_API_BASE_URL}/sports/americanfootball_nfl/events/${ev.id}/odds`;
+					try {
+						const r = await axios.get(url, {
+							params: {
+								apiKey: ODDS_API_KEY,
+								regions: 'us',
+								markets,
+								oddsFormat: 'american'
+							}
+						});
+						logOddsHeaders(r.headers);
+						return { ev, data: r.data };
+					} catch (e) {
+						// Return empty on plan/market restrictions or errors to continue others
+						const status = e.response?.status;
+						if (status === 403 || status === 422) return { ev, data: null, warning: 'Player props not available for this API plan or markets' };
+						return { ev, data: null, error: e.message };
+					}
+				});
 
-									bets.push({
-							id: `${game.id}-${key}-${player}-${type}`,
-							player,
-							team,
-										opponent: `${team === home ? 'vs ' + away : team === away ? '@ ' + home : 'vs ' + opponentBy(team)}`,
-							prop,
-							line,
-							type,
-							odds,
-							grade,
-							hitProbability,
-							edge: Math.max(0, Math.round((hitProbability - 50) * 10) / 10),
-							gameTime,
-							keyFactors: [
-								{ factor: 'Market Price', weight: 16, score: hitProbability },
-								{ factor: 'Opponent Defense', weight: 13, score: 60 },
-								{ factor: 'Usage Rate', weight: 9, score: 65 },
-								{ factor: 'Recent Performance', weight: 16, score: 62 }
-							],
-							recentForm: 'N/A',
-							injury: 'N/A',
-							weather: 'Unknown',
-							updated: 'just now'
+				const propMap = {
+					player_pass_yds: 'Passing Yards',
+					player_rec_yds: 'Receiving Yards',
+					player_rush_yds: 'Rushing Yards',
+					player_receptions: 'Receptions',
+					player_rush_att: 'Rushing Attempts',
+					player_pass_tds: 'Passing TDs',
+					player_anytime_td: 'Anytime TD'
+				};
+
+				const bets = [];
+				let warning = null;
+				perEvent.forEach(({ ev, data, warning: w }) => {
+					if (w && !warning) warning = w;
+					if (!data) return;
+					const gameTime = ev.commence_time;
+					const home = ev.home_team;
+					const away = ev.away_team;
+					if (!isFutureCommence(gameTime)) return;
+					const opponentBy = (team) => (team === home ? away : home);
+
+					// Data shape mirrors odds endpoint: bookmakers -> markets -> outcomes
+					const marketsArr = (data.bookmakers || []).flatMap(b => b.markets || []);
+					marketsArr.forEach(mkt => {
+						const key = mkt.key || '';
+						(mkt.outcomes || []).forEach(out => {
+							const player = out.description || out.participant || out.name || null;
+							const overUnder = (out.name || '').toLowerCase();
+							if (!player) return;
+							const derivedTeam = parseTeamFromText(out.description || out.participant || player, home, away);
+							const team = derivedTeam || home;
+							const prop = propMap[key] || key;
+							const type = overUnder.includes('over') ? 'Over' : overUnder.includes('under') ? 'Under' : 'Over';
+							const line = out.point ?? null;
+							const odds = out.price ?? null;
+							if (odds == null || line == null) return;
+							const prob = impliedProbability(odds) ?? 0.5;
+							const hitProbability = Math.round(prob * 100);
+							const grade = gradeFromProbability(prob);
+							if (!['A+','A','B+','B','C+'].includes(grade)) return;
+							bets.push({
+								id: `${ev.id}-${key}-${player}-${type}`,
+								player,
+								team,
+								opponent: `${team === home ? 'vs ' + away : team === away ? '@ ' + home : 'vs ' + opponentBy(team)}`,
+								prop,
+								line,
+								type,
+								odds,
+								grade,
+								hitProbability,
+								edge: Math.max(0, Math.round((hitProbability - 50) * 10) / 10),
+								gameTime,
+								keyFactors: [
+									{ factor: 'Market Price', weight: 16, score: hitProbability },
+									{ factor: 'Opponent Defense', weight: 13, score: 60 },
+									{ factor: 'Usage Rate', weight: 9, score: 65 },
+									{ factor: 'Recent Performance', weight: 16, score: 62 }
+								],
+								recentForm: 'N/A',
+								injury: 'N/A',
+								weather: 'Unknown',
+								updated: 'just now'
+							});
 						});
 					});
 				});
-			});
 
-			const payload = { count: bets.length, bets };
-			cache.nflProps = { data: payload, at: Date.now() };
-			saveCacheToDisk();
-			res.json(payload);
+				const payload = { count: bets.length, bets, warning: warning || undefined };
+				cache.nflProps = { data: payload, at: Date.now() };
+				saveCacheToDisk();
+				res.json(payload);
 			} catch (err) {
 				const status = err.response?.status || 500;
 				if (status === 403 || status === 422) {
